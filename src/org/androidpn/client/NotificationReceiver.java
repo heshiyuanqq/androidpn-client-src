@@ -1,0 +1,709 @@
+/*
+ * Copyright (C) 2010 Moduad Co., Ltd.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.androidpn.client;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Timer;
+import java.util.TimerTask;
+
+import org.apache.http.NameValuePair;
+import org.apache.http.message.BasicNameValuePair;
+import org.json.JSONArray;
+import org.json.JSONException;
+
+import android.app.ActivityManager;
+import android.app.ActivityManager.RunningServiceInfo;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences.Editor;
+import android.net.wifi.WifiInfo;
+import android.net.wifi.WifiManager;
+import android.util.Log;
+
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+import com.lte.bean.ActionBean;
+import com.lte.bean.CaseBean;
+import com.lte.bean.SetupBean;
+import com.lte.config.ConfigSP;
+import com.lte.config.ConfigTest;
+import com.lte.test.LogicService;
+import com.lte.test.SignalService;
+import com.lte.util.CMDUtil;
+import com.lte.util.IOUtil;
+import com.lte.util.NetUtil;
+import com.lte.util.PowerResponce;
+
+/**
+ * Broadcast receiver that handles push notification messages from the server.
+ * This should be registered as receiver in AndroidManifest.xml.
+ * 
+ * @author Sehwan Noh (devnoh@gmail.com)
+ */
+public final class NotificationReceiver extends BroadcastReceiver {
+
+	private static final String LOGTAG = LogUtil.makeLogTag(NotificationReceiver.class);
+	Context context;
+	// private NotificationService notificationService;
+	private TimerTaskSchedule timerTaskSchedule;
+	// 定义WifiManager对象
+	private WifiManager mWifiManager;
+	// 定义WifiInfo对象
+	private WifiInfo mWifiInfo;
+	// imsi (手机)
+	private String strImsi;
+	// strIp 手机端的ip
+	private String strIp;
+
+	private String charging;
+
+	int power, powerlow, powerhigh;
+
+	public NotificationReceiver() {
+	}
+
+	// public NotificationReceiver(NotificationService notificationService) {
+	// this.notificationService = notificationService;
+	// }
+
+	@Override
+	public void onReceive(Context contextParam, Intent intent) {
+
+		context = contextParam;
+		Log.d(LOGTAG, "NotificationReceiver.onReceive()...");
+		String action = intent.getAction();
+		Log.d(LOGTAG, "action=" + action);
+
+		if (Constants.ACTION_SHOW_NOTIFICATION.equals(action)) {
+			String notificationId = intent.getStringExtra(Constants.NOTIFICATION_ID);
+			String notificationApiKey = intent.getStringExtra(Constants.NOTIFICATION_API_KEY);
+			String notificationTitle = intent.getStringExtra(Constants.NOTIFICATION_TITLE);
+			final String notificationMessage = intent
+					.getStringExtra(Constants.NOTIFICATION_MESSAGE);
+			String notificationUri = intent.getStringExtra(Constants.NOTIFICATION_URI);
+
+			Log.d(LOGTAG, "notificationMessage=" + notificationMessage);
+
+			Notifier notifier = new Notifier(contextParam);
+			notifier.notify(notificationId, notificationApiKey, notificationTitle,
+					notificationMessage, notificationUri);
+			// 根据notificationTitle发送的值进行判断是哪一个指令
+			try {
+				Integer.parseInt(notificationTitle);
+
+			} catch (Exception e) {
+				// TODO: handle exception
+				System.out.println("notificationTitle不为整数！");
+			}
+			switch (Integer.parseInt(notificationTitle)) {
+			case ConfigTest.LOGIC_ORDER:
+				Editor editor = context.getSharedPreferences(ConfigSP.SP_reseach,
+						Context.MODE_PRIVATE).edit();// 初始化存储器
+				editor.putString(ConfigSP.SP_ISUpload, "false").commit();
+
+				if (ConfigTest.isDo == 0) {// 当前没有任务执行
+					new Thread() {
+						public void run() {
+							String registerIp = context.getSharedPreferences(ConfigSP.SP_reseach,
+									Context.MODE_PRIVATE).getString(ConfigSP.SP_reseach_ip, "");
+							String serverIp = "http://" + registerIp;
+							strImsi = context.getSharedPreferences(ConfigSP.SP_reseach,
+									Context.MODE_PRIVATE).getString(ConfigSP.SP_reseach_Imsi, "");
+							NameValuePair pairImsi = new BasicNameValuePair("imsino", strImsi); // Imsi
+							List<NameValuePair> paramList = new ArrayList<NameValuePair>();
+							paramList.add(pairImsi);
+							String url = serverIp
+									+ ":8080/ResearchProject/sendcasemanager/sendstate";
+							NetUtil.getInstance().httpUpload(context, url, paramList);
+							// 修改任务执行标识位，
+							ConfigTest.isDo = 1;
+							logic(notificationMessage);
+						};
+					}.start();
+				} else {
+					Log.e("有任务正在执行", "有任务正在执行");
+				}
+
+				break;
+			case ConfigTest.SIGNAL_ORDER:
+				switchSignaleSrvice(notificationMessage);
+				break;
+			case ConfigTest.POWERLOW_SET:
+				setpowerlow(notificationMessage);
+				break;
+			case ConfigTest.LOG_ORDER:
+				/**
+				 * 平台发送上传指令，手机端才开始上传（不是主动上传）
+				 */
+				/*
+				 * new Thread() { public void run() { try {
+				 * LogUpLoad.newUpLoad(context); } catch (Exception e) { // TODO
+				 * Auto-generated catch block e.printStackTrace(); } };
+				 * }.start();
+				 */
+				break;
+			case ConfigTest.ADB_ORDER:
+				onAdb(notificationMessage);
+				break;
+			default:
+				System.out.println("非法指令");
+				break;
+			}
+		}
+
+	}
+
+	// 运行adb远程命令
+	private void onAdb(String notificationMessage) {
+		// TODO Auto-generated method stub
+		String adb01 = "setprop service.adb.tcp.port 5555";
+		String adb02 = "stop adbd";
+		String adb03 = "start adbd";
+		String[] cmd01 = new String[] { "su", adb01 };
+		String[] cmd02 = new String[] { "su", adb02 };
+		String[] cmd03 = new String[] { "su", adb03 };
+		try {
+			CMDUtil.execShellCMD(cmd01, 3);
+			CMDUtil.execShellCMD(cmd02, 3);
+			CMDUtil.execShellCMD(cmd03, 3);
+			new Thread() {
+				public void run() {
+					String registerIp = context.getSharedPreferences(ConfigSP.SP_reseach,
+							Context.MODE_PRIVATE).getString(ConfigSP.SP_reseach_ip, "");
+					String serverIp = "http://" + registerIp;
+					strImsi = context.getSharedPreferences(ConfigSP.SP_reseach,
+							Context.MODE_PRIVATE).getString(ConfigSP.SP_reseach_Imsi, "");
+					WifiInfo wifiInfo = mWifiManager.getConnectionInfo();
+					int ipAddress = wifiInfo.getIpAddress();
+					strIp = intToIp(ipAddress);
+					NameValuePair pairImsi = new BasicNameValuePair("strImsi", strImsi); // Imsi
+					NameValuePair pairIp = new BasicNameValuePair("strIp", strIp);// 手机端的ip
+					List<NameValuePair> paramList = new ArrayList<NameValuePair>();
+					paramList.add(pairImsi);
+					paramList.add(pairIp);
+
+					String url = serverIp + ":8080/ResearchProject/sendcasemanager/sendstate";
+					NetUtil.getInstance().httpUpload(context, url, paramList);
+				};
+			}.start();
+		} catch (Exception exception) {
+			exception.printStackTrace();
+		} catch (Error error) {
+			error.printStackTrace();
+		}
+
+	}
+
+	/**
+	 * 判断某个服务是否正在运行的方法
+	 * 
+	 * @param context
+	 * @param serviceName
+	 *            是包名+服务的类名（例如：net.loonggg.testbackstage.TestService）
+	 * @return true代表正在运行，false代表服务没有正在运行
+	 */
+	public boolean isServiceWork(Context context, String serviceName) {
+		boolean isWork = false;
+		ActivityManager myAM = (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
+		List<RunningServiceInfo> myList = myAM.getRunningServices(40);
+		if (myList.size() <= 0) {
+			return false;
+		}
+		for (int i = 0; i < myList.size(); i++) {
+			String mName = myList.get(i).service.getClassName().toString();
+			if (mName.equals(serviceName)) {
+				isWork = true;
+				break;
+			}
+		}
+		return isWork;
+	}
+
+	// private void switchBatteryService(String notificationMessage) {
+	// if (notificationMessage.equals("open")) {
+	// Intent intent = new Intent(context, BatteryService.class);
+	// context.startService(intent);// 启动电量测试服务
+	// } else if (notificationMessage.equals("close")) {
+	// Intent intent = new Intent(context, BatteryService.class);
+	// context.stopService(intent);
+	// } else {
+	// System.out.println("非开关指令，指令错误！");
+	// }
+	// }
+	/**
+	 * 手机端的ip地址
+	 * 
+	 * @return
+	 */
+	private String intToIp(int i) {
+
+		return (i & 0xFF) + "." + ((i >> 8) & 0xFF) + "." + ((i >> 16) & 0xFF) + "."
+				+ (i >> 24 & 0xFF);
+	}
+
+	private void setpowerlow(String notificationMessage) {
+		try {
+			powerlow = Integer.parseInt(notificationMessage);
+			final Editor editor = context.getSharedPreferences(ConfigSP.SP_reseach,
+					Context.MODE_PRIVATE).edit();
+			// -------------------------------------------------------------------------------------------------
+			try {
+				charging = context.getSharedPreferences(ConfigSP.SP_reseach, Context.MODE_PRIVATE)
+						.getString(ConfigSP.SP_reseach_charging, "");
+			} catch (Exception e) {
+				// TODO: handle exception
+				charging = "null" + e;
+			}
+			// -------------------------------------------------------------------------------------------------
+			editor.putString(ConfigSP.SP_reseach_power_low, notificationMessage).commit();
+			System.out.println(context.getSharedPreferences(ConfigSP.SP_reseach,
+					Context.MODE_PRIVATE).getString(ConfigSP.SP_reseach_power_low, "无值"));
+
+			try {
+				power = Integer.parseInt(context.getSharedPreferences(ConfigSP.SP_reseach,
+						Context.MODE_PRIVATE).getString(ConfigSP.SP_reseach_power, ""));
+			} catch (Exception e) {
+				// TODO: handle exception
+				power = 0;
+				System.out.println("NotificationReceiver:" + power + ";" + e);
+			}
+
+			try {
+				powerhigh = Integer.parseInt(context.getSharedPreferences(ConfigSP.SP_reseach,
+						Context.MODE_PRIVATE).getString(ConfigSP.SP_reseach_power_high, "100"));
+			} catch (Exception e) {
+				// TODO: handle exception
+				powerhigh = 100;
+				System.out.println("NotificationReceiver:" + powerhigh + ";" + e);
+			}
+			// if(power <= powerlow && !charging){
+			// editor.putString(ConfigSP.SP_reseach_BatteryResponse, "电量低,请充电!")
+			// .commit();
+			// }else if(power >= powerhigh && charging){
+			// editor.putString(ConfigSP.SP_reseach_BatteryResponse, "已充满,请断电!")
+			// .commit();
+			// }
+			Runnable runnable = new Runnable() {
+				@Override
+				public void run() {
+					if ("true".equals(charging)) {
+						System.out.println("NotificationReceiver:" + charging);
+						if (power >= powerhigh) {
+							System.out.println("已充满,请断电!");
+							String re = PowerResponce.getInstance().responce(context, "high");
+							editor.putString(ConfigSP.SP_reseach_BatteryResponse, re + ":已充满,请断电!")
+									.commit();
+						} else {
+							System.out.println("充电中!" + charging);
+							editor.putString(ConfigSP.SP_reseach_BatteryResponse, "充电中!").commit();
+						}
+					} else if ("false".equals(charging)) {
+						System.out.println("NotificationReceiver:" + charging);
+						if (power <= powerlow) {
+							System.out.println("电量低,请充电!");
+							String re = PowerResponce.getInstance().responce(context, "low");
+							editor.putString(ConfigSP.SP_reseach_BatteryResponse, re + ":电量低,请充电!")
+									.commit();
+						} else {
+							System.out.println("没充电!" + charging);
+							editor.putString(ConfigSP.SP_reseach_BatteryResponse, "没充电!").commit();
+						}
+					} else {
+						System.out.println(charging + "*");
+					}
+				}
+			};
+			new Thread(runnable).start();
+		} catch (Exception e) {
+			// TODO: handle exception
+			System.out.println("非整数，指令错误！" + e);
+		}
+	}
+
+	private void switchSignaleSrvice(String notificationMessage) {
+		if (notificationMessage.equals("GETSIGNAL")) {
+			Intent intent = new Intent(context, SignalService.class);
+			context.stopService(intent);
+			context.startService(intent);// 启动测试信号服务
+		} else if (notificationMessage.equals("close")) {
+			Intent intent = new Intent(context, SignalService.class);
+			context.stopService(intent);
+		} else {
+			System.out.println("非开关指令，指令错误！");
+		}
+	}
+
+	private void logic(String notificationMessage) {
+		// TODO Auto-generated method stub
+
+		// System.out.println("这是notificationMessage：" + notificationMessage);
+
+		// split[0] 逻辑顺序（并发、顺序 ） logic
+		// split[1]参数 parameter
+		// split[2]setup 各种log保存的路径
+		ConfigTest.CASE_LIST = new ArrayList<List<ActionBean>>();
+		String[] split = notificationMessage.split("###");
+		String logic = split[0];
+		// 解析逻辑顺序split[0]
+		Gson gson = new Gson();
+		// TypeToken<List<List<ActionBean>>> actionLogic = new
+		// TypeToken<List<List<ActionBean>>>() {
+		// };
+		TypeToken<List<CaseBean>> actionLogic = new TypeToken<List<CaseBean>>() {
+		};
+
+		// ConfigTest.CASE_LIST = gson.fromJson(logic,
+		// actionLogic.getType());
+		List<CaseBean> behaviorList = gson.fromJson(logic, actionLogic.getType());
+
+		for (int i = 0; i < behaviorList.size(); i++) {
+			CaseBean caseBean = behaviorList.get(i);
+			List<ActionBean> behavior = caseBean.getBehavior();
+			ConfigTest.CASE_LIST.add(behavior);
+
+		}
+
+		// Intent logicIntent = new Intent(context, LogicService.class);
+		// context.startService(logicIntent);
+
+		String parameter = split[1];
+		// 将参数split[1]保存到sdcard中
+		try {
+			JSONArray jsonArray = new JSONArray(parameter);
+			for (int i = 0; i < jsonArray.length(); i++) {
+				IOUtil.writeStringToFile("[" + jsonArray.getString(i) + "]", "sdcard/testcase",
+						"sdcard/testcase/parameter" + i + ".json", false);
+			}
+		} catch (JSONException e) {
+			e.printStackTrace();
+		}
+
+		String setUp = split[2];
+		// 得到setUp.json 文件中保存路径
+		// ConfigTest.SETUP_PATH = setUp.substring(13, setUp.length() -
+		// "\"}]".length());// [{"logpath":"/sdcard/testcase/"}]
+
+		// 将split[2]json保存
+		Gson setupGson = new Gson();
+		TypeToken<SetupBean> setupType = new TypeToken<SetupBean>() {
+		};
+		SetupBean setupBean = setupGson.fromJson(split[2], setupType.getType());
+		// TelephonyManager tm = (TelephonyManager) context
+		// .getSystemService(context.TELEPHONY_SERVICE);
+
+		// 转化时间格式
+		// long time = Long.parseLong(setupBean.getTime());
+		// SimpleDateFormat sdf = new
+		// SimpleDateFormat("yyyy年MM月dd日HH时mm分ss秒");
+		// String sDateTime = sdf.format(time); // 得到精确到秒的表示：08/31/2006
+
+		// 转换时间格式
+		String setupJson = "[{\"logpath\":\""
+				+ setupBean.getLogpath()
+				+ context.getSharedPreferences(ConfigSP.SP_reseach, Context.MODE_PRIVATE)
+						.getString(ConfigSP.SP_phone_id, "12345") + "_" + setupBean.getCasename()
+				+ "_" + setupBean.getTime() + "_file" + "\"," + "\"testcaseparafile\":\""
+				+ setupBean.getLogpath() + "parameter.json\"}]";
+		// 获得log文件夹的名字
+		ConfigTest.LOG_FILE_NAME = context.getSharedPreferences(ConfigSP.SP_reseach,
+				Context.MODE_PRIVATE).getString(ConfigSP.SP_phone_id, "12345")
+				+ "_" + setupBean.getCasename() + "_" + setupBean.getTime() + "_file";
+		Log.i("--info--time--", setupBean.getTime());
+		// 获得测试action的名字
+		ConfigTest.ACTION_NAME = setupBean.getCasename();
+		// 获得log文件夹的时间值
+		ConfigTest.LOG_FILE_TIME = setupBean.getTime();
+
+		// 获得定时器的时间
+		ConfigTest.CLOCK = setupBean.getClock();
+
+		IOUtil.writeStringToFile(setupJson, "sdcard/testcase", "sdcard/testcase/setup.json", false);
+
+		if (setupBean.getDoubleroute().equals("0")) {// 进入黑盒测试，关闭wifi
+			// ServiceManager serviceManager = new ServiceManager(context);
+			// serviceManager.startService();
+			/**
+			 * 信号强度、小区ID、PN暂时不关闭
+			 */
+
+			// Intent intent = new Intent(context, BatteryService.class);
+			// context.stopService(intent);// 停止测试电量服务
+			// Intent intent1 = new Intent(context, SignalService.class);
+			// context.stopService(intent1);// 停止信号测试服务
+
+			// 取得WifiManager对象
+			mWifiManager = (WifiManager) context.getSystemService(Context.WIFI_SERVICE);
+			// 取得WifiInfo对象
+			mWifiInfo = mWifiManager.getConnectionInfo();
+			// 关闭WiFi连接
+			// if (mWifiManager.isWifiEnabled()) {
+			// mWifiManager.setWifiEnabled(false);
+			// }
+
+			/**
+			 * 关闭PN重连线程
+			 */
+			// NotificationService.getinstance().getXmppManager().setIsTesting(true);
+
+			// 开始测试服务
+			Intent logicIntent = new Intent(context, LogicService.class);
+			context.startService(logicIntent);
+		} else {// 进入双通道测试，
+				// 开始测试服务
+			Intent logicIntent = new Intent(context, LogicService.class);
+			context.startService(logicIntent);
+		}
+
+		/*
+		 * //将jar写入 try { IOUtil.writeStreamToFile("sdcard/testcase",
+		 * contextParam.getResources().getAssets().open("testcase.jar"), new
+		 * File("sdcard/testcase/testcase.jar")); } catch (IOException e) {
+		 * e.printStackTrace(); }
+		 */
+		/*
+		 * String[] cmd = new String[] { "su", "uiautomator runtest " +
+		 * "/sdcard" + "/" + "testcase" + "/" + "testcase.jar" +
+		 * " -c com.testcase." + taskArr[i] }; CMDUtil.execShellCMD(cmd);
+		 */
+		/*
+		 * String[] cmd = new String[] { "su",
+		 * "uiautomator runtest /sdcard/testcase/UiAutomatorPrjDemo.jar -c com.WeiXinText"
+		 * }; try { CMDUtil.execShellCMD(cmd); } catch (IOException e) {
+		 * e.printStackTrace(); } catch (InterruptedException e) {
+		 * e.printStackTrace(); }
+		 */
+
+		/*
+		 * String[] taskArr = {"TelCaseUI", "SMSCaseUI", "WeiXinTextCase"}; try
+		 * { String[] cmd; for (int i = 0; i < taskArr.length; i++) { cmd = new
+		 * String[] { "su", "uiautomator runtest " + "/sdcard" + "/" +
+		 * "testcase" + "/" + "testcase.jar" + " -c com.testcase." + taskArr[i]
+		 * }; CMDUtil.execShellCMD(cmd); switch (i) { case 0: Thread
+		 * .sleep(Integer.parseInt(terminalConfigVO.getDialDuration())*
+		 * Integer.parseInt(terminalConfigVO.getDialRepeatTimes())*1000+
+		 * 10*1000); break; case 1: Thread.sleep(20*1000); break; case 2:
+		 * 
+		 * break; default: break; } // Thread.sleep(30*1000); } } catch
+		 * (IOException e) { e.printStackTrace(); } catch (InterruptedException
+		 * e) { e.printStackTrace(); }
+		 */
+
+		// // 配置###{}
+		//
+		//
+		// //将关系/标准分开
+		// String[] split = notificationMessage.split("###");
+		// Gson gson = new Gson();
+		// if ("\"配置命令\"".equals(split[0])) {
+		// //标准
+		// TypeToken<ArrayList<ConfigMsgBean>> ruleToken = new
+		// TypeToken<ArrayList<ConfigMsgBean>>(){};
+		// ArrayList<ConfigMsgBean> configList = gson.fromJson(split[1],
+		// ruleToken.getType());
+		// SharedPreferences sp =
+		// context.getSharedPreferences(ConfigPN.SP_SET,
+		// Context.MODE_PRIVATE);
+		// Editor editor = sp.edit();
+		// for (int i = 0; i < configList.size(); i++) {
+		// ConfigMsgBean ConfigMsgBean = configList.get(i);
+		// editor.putString(ConfigMsgBean.getStrEnKey(),
+		// ConfigMsgBean.getStrParameter());
+		// }
+		// editor.commit();
+		// return;
+		// }
+		//
+		//
+		// //环境校准
+		// if ("环境校准".equals(split[0])) {
+		// //标准
+		// TypeToken<CalibrationBean> calibrationToken = new
+		// TypeToken<CalibrationBean>(){};
+		// CalibrationBean calibrationBean = gson.fromJson(split[1],
+		// calibrationToken.getType());
+		// Intent correctIntent = new Intent(contextParam, AcCorrect.class);
+		// correctIntent.putExtra("strProject",
+		// calibrationBean.getStrProject());
+		// correctIntent.putExtra("dateTime",
+		// calibrationBean.getStrDateTime());
+		// correctIntent.putExtra("strBands",
+		// calibrationBean.getStrBands());
+		// correctIntent.putExtra("signalWaitTime",
+		// calibrationBean.getSignalWaitTime()+"");
+		// correctIntent.putExtra("executeWaitTime",
+		// calibrationBean.getExecuteWaitTime()+"");
+		// correctIntent.putExtra("upWaitTime",
+		// calibrationBean.getUpWaitTime()+"");
+		// correctIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+		// contextParam.startActivity(correctIntent);
+		// return;
+		// }
+		//
+		//
+		// //关系
+		// TypeToken<List<RelationBean>> relationToken = new
+		// TypeToken<List<RelationBean>>(){};
+		// List<RelationBean> relationJson = gson.fromJson(split[0],
+		// relationToken.getType());
+		// IntentData.getInstance().setIntent_Testing_relationList(relationJson);
+		//
+		// //标准
+		// TypeToken<Map<String, ArrayList<RuleBean>>> ruleToken = new
+		// TypeToken<Map<String, ArrayList<RuleBean>>>(){};
+		// Map<String, ArrayList<RuleBean>> ruleJson =
+		// gson.fromJson(split[1], ruleToken.getType());
+		// IntentData.getInstance().setIntent_Testing_ruleMap(ruleJson);
+		//
+		// //服务器传时间
+		// String dateTimeServer = split[2];
+		// SharedPreferences sp =
+		// contextParam.getSharedPreferences(ConfigPN.SP_PN,
+		// Context.MODE_PRIVATE);
+		// Editor editor = sp.edit();
+		// editor.putString("dateTimeServer", dateTimeServer);
+		// editor.commit();
+		//
+		// //服务器传测试类型（定时/正常）
+		// String taskType = split[3];
+		//
+		// //测试次数
+		// int testTimes = relationJson.get(0).getIntTestTimes();
+		// IntentData.getInstance().setIntent_Testing_times(testTimes);
+		//
+		//
+		// //开始测试
+		// //若未设置“交互热点账号”||”交互热点密码“则不测试
+		// String interactionAPID =
+		// contextParam.getSharedPreferences(ConfigPN.SP_SET,
+		// Context.MODE_PRIVATE).getString(ConfigPN.SP_SET_GLOBALAPID, "");
+		// String interactionAPPW =
+		// contextParam.getSharedPreferences(ConfigPN.SP_SET,
+		// Context.MODE_PRIVATE).getString(ConfigPN.SP_SET_GLOBALAPPW, "");
+		// if (interactionAPID.equals("") || interactionAPPW.equals("")) {
+		// Toast.makeText(contextParam, "尚未设置交互热点，无法进行测试",
+		// Toast.LENGTH_LONG).show();
+		// } else {
+		// //正常测试
+		// if (taskType.equals("normalTask")) {
+		// Intent skipAcTestingIntent = new Intent(contextParam,
+		// AcTesting.class);
+		// skipAcTestingIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+		// contextParam.startActivity(skipAcTestingIntent);
+		// //定时测试
+		// } else if (taskType.equals("terminalTask")) {
+		// // SimpleDateFormat sdf = new
+		// SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+		// Date date = new Date(Long.parseLong(dateTimeServer));
+		//
+		//
+		// AlarmManager am = (AlarmManager)
+		// context.getSystemService(Context.ALARM_SERVICE);
+		// Intent intent_broadcast = new Intent(context,
+		// TimerReceiver.class);
+		// PendingIntent pendingIntent = PendingIntent.getBroadcast(context,
+		// 0, intent_broadcast, 0);
+		// System.out.println(Long.parseLong(dateTimeServer)+ " - "+
+		// System.currentTimeMillis());
+		// am.set(AlarmManager.RTC_WAKEUP, Long.parseLong(dateTimeServer),
+		// pendingIntent); //睡眠状态下会唤醒系统并执行提示功能
+		// }
+		// }
+	}
+
+	// 定时开始测试
+	Timer timer = new Timer();
+
+	private class TimerTaskSchedule extends TimerTask {
+		@Override
+		public void run() {
+			// System.out.println("------------------ 执行 ------------------");
+			// Intent skipAcTestingIntent = new Intent(context,
+			// AcTesting.class);
+			// skipAcTestingIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+			// context.startActivity(skipAcTestingIntent);
+		}
+	};
+
+	// public String responce(String strPowerType) {
+	//
+	// String strImsi = context.getSharedPreferences(ConfigSP.SP_reseach,
+	// Context.MODE_PRIVATE).getString(ConfigSP.SP_reseach_Imsi, "");// 手机卡唯一标识
+	// // 从存储文件内读取ip
+	// String ip = context.getApplicationContext()
+	// .getSharedPreferences(ConfigSP.SP_reseach,// 表名
+	// Context.MODE_PRIVATE).getString(ConfigSP.SP_reseach_ip,// key名
+	// "");
+	// String serverIp = "http://" + ip;
+	// String url = serverIp + ":8080/ResearchProject/terminal/requestPower"
+	// + "?method=GET&strImsi=" + strImsi + "&strPowerType="
+	// + strPowerType;// url地址
+	//
+	// String result = "";// 存储返回值
+	//
+	// Log.i("url", url);
+	//
+	// /* 建立HTTP Get对象 */
+	// HttpGet httpRequest = new HttpGet(url);
+	//
+	// try {
+	// /* 发送请求并等待响应 */
+	// HttpResponse httpResponse = new DefaultHttpClient()
+	// .execute(httpRequest);
+	// /* 若状态码为200 ok */
+	// if (httpResponse.getStatusLine().getStatusCode() == 200) {
+	// String response = EntityUtils
+	// .toString(httpResponse.getEntity());
+	// if ("SUCCESS".equals(response)) {
+	// System.out.println("电量检测请求成功");
+	// result = "请求成功";
+	// } else if ("FAILED".equals(response)) {
+	// System.out.println("电量检测请求失败");
+	// result = "请求失败";
+	// }
+	// // else {
+	// // System.out.println("电量检测请求意外故障" + response);
+	// // result = "意外请求故障";
+	// // }
+	// }
+	//
+	// // } catch (Exception e) {
+	// // System.out.println("Http请求失败");
+	// // result = "Http请求失败";
+	// } catch (ClientProtocolException e) {
+	// result = "Http请求失败ClientProtocolException:" + e;
+	// } catch (IOException e) {
+	// result = "Http请求失败IOException:" + e;
+	// } catch (Exception e) {
+	// result = "Http请求失败Exception:" + e;
+	// }
+	//
+	// return result;
+	// }
+
+}
+
+// // 更新数据库的广播接收器
+// public static class UpdateReceiver extends BroadcastReceiver {
+// public void onReceive(Context context, Intent intent) {
+// Toast.makeText(context, "更新比分数据", Toast.LENGTH_LONG).show();
+//
+// // 设置全局定时器(闹钟) 60秒后再发广播通知本广播接收器触发执行.
+// // 这种方式很像JavaScript中的 setTimeout(xxx,60000)
+// AlarmManagerUtil.sendUpdateBroadcast(context);
+// }
+// }
